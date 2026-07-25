@@ -84,6 +84,144 @@ describe('hydrateRoot(document, <html/>)', () => {
     expect(errors).toEqual([])
   })
 
+  it('preserves foreign nodes after expected document body children', () => {
+    function App() {
+      return (
+        <html>
+          <head>
+            <title>test</title>
+          </head>
+          <body>
+            <main id="app">app</main>
+          </body>
+        </html>
+      )
+    }
+
+    const doc = buildDocumentFrom(
+      '<!doctype html><html><head><title>test</title></head><body><main id="app">app</main><script>window.__stream=1</script><iframe hidden title="edge"></iframe><div hidden id="S:3"><span>late</span></div></body></html>',
+    )
+    const originalMain = doc.querySelector('main')
+    const originalIframe = doc.querySelector('iframe')
+    const errors: unknown[] = []
+
+    hydrateRoot(doc as any, <App />, {
+      onRecoverableError: (e) => errors.push(e),
+      onUncaughtError: (e) => errors.push(e),
+    })
+
+    expect(errors).toEqual([])
+    expect(doc.querySelector('main')).toBe(originalMain)
+    expect(doc.querySelector('script')?.textContent).toBe('window.__stream=1')
+    expect(doc.querySelector('iframe')).toBe(originalIframe)
+    expect(doc.getElementById('S:3')).not.toBeNull()
+  })
+
+  it('recovers a mismatch when lazy hydration resumes inside Suspense', async () => {
+    let resolve!: (value: { default: () => React.ReactElement }) => void
+    const pending = new Promise<{ default: () => React.ReactElement }>(
+      (r) => (resolve = r),
+    )
+    const LazyHead = React.lazy(() => pending)
+
+    function HeadContent() {
+      return <meta name="color-scheme" content="dark" />
+    }
+    function Counter() {
+      const [count, setCount] = React.useState(0)
+      return <button onClick={() => setCount(count + 1)}>{count}</button>
+    }
+    function App() {
+      return (
+        <html>
+          <head>
+            <React.Suspense fallback={null}>
+              <LazyHead />
+            </React.Suspense>
+          </head>
+          <body>
+            <Counter />
+          </body>
+        </html>
+      )
+    }
+
+    const doc = buildDocumentFrom(
+      '<!doctype html><html><head><meta name="color-scheme" content="light"></head><body><button>0</button></body></html>',
+    )
+    const recoverable: unknown[] = []
+    const uncaught: unknown[] = []
+    hydrateRoot(doc as any, <App />, {
+      onRecoverableError: (e) => recoverable.push(e),
+      onUncaughtError: (e) => uncaught.push(e),
+    })
+
+    resolve({ default: HeadContent })
+    await new Promise((r) => setTimeout(r, 0))
+    await Promise.resolve()
+
+    expect(recoverable).toHaveLength(1)
+    expect(uncaught).toEqual([])
+    expect(doc.head.querySelector('meta')?.getAttribute('content')).toBe('dark')
+    const button = doc.querySelector('button') as HTMLButtonElement
+    flushSync(() => button.click())
+    expect(button.textContent).toBe('1')
+  })
+
+  it('claims typeless and typed head scripts in document order', () => {
+    const content = '{"verification":true}'
+    let adopted: HTMLScriptElement | null = null
+
+    function App() {
+      return (
+        <html>
+          <head>
+            <script
+              ref={(node: HTMLScriptElement | null) => {
+                adopted = node
+              }}
+              dangerouslySetInnerHTML={{ __html: content }}
+            />
+            <script
+              type="application/ld+json"
+              dangerouslySetInnerHTML={{ __html: content }}
+            />
+          </head>
+          <body />
+        </html>
+      )
+    }
+
+    const doc = buildDocumentFrom(
+      `<!doctype html><html><head><script>${content}</script><script type="application/ld+json">${content}</script></head><body></body></html>`,
+    )
+    const first = doc.head.querySelector('script')
+    const errors: unknown[] = []
+    hydrateRoot(doc as any, <App />, {
+      onRecoverableError: (e) => errors.push(e),
+    })
+
+    expect(errors).toEqual([])
+    expect(adopted).toBe(first)
+  })
+
+  it('hydrates matching raw script content without HTML normalization', () => {
+    const source = 'if (window.a && window.b) window.c = 1'
+    const container = document.createElement('div')
+    container.innerHTML = `<script>${source}</script>`
+    const original = container.firstElementChild
+    const errors: unknown[] = []
+
+    hydrateRoot(
+      container,
+      <script dangerouslySetInnerHTML={{ __html: source }} />,
+      { onRecoverableError: (e) => errors.push(e) },
+    )
+
+    expect(errors).toEqual([])
+    expect(container.firstElementChild).toBe(original)
+  })
+
   it('a root-level component suspending during hydration does not append a second <html>', async () => {
     // Mirrors Start's <StartClient/> → <Await promise={...}> pattern: the
     // root-most component throws a promise synchronously during hydrateRoot.
@@ -184,5 +322,169 @@ describe('hydrateRoot(document, <html/>)', () => {
       (n) => n.nodeType === 1 && (n as Element).tagName.toLowerCase() === 'html',
     )
     expect(htmlEls.length).toBe(1)
+  })
+
+  it('ignores extension-injected styles before an identified app style', () => {
+    let doc!: Document
+
+    function App() {
+      const htmlClass = doc.documentElement.className
+      return (
+        <html className={htmlClass}>
+          <head>
+            <style id="critical">{'body{color:red}'}</style>
+          </head>
+          <body>
+            <h1 style={{ color: 'red' }}>app</h1>
+          </body>
+        </html>
+      )
+    }
+
+    doc = buildDocumentFrom(
+      '<!doctype html><html class="dark"><head><style class="darkreader">html{background:black}</style><style id="critical">body{color:red}</style></head><body><h1 style="color:red;--darkreader-inline-color:#ff1a1a" data-darkreader-inline-color="">app</h1></body></html>',
+    )
+    const originalHtml = doc.documentElement
+    const originalHead = doc.head
+    const originalCriticalStyle = doc.querySelector('#critical')
+    const injectedStyle = doc.querySelector('.darkreader')
+    const originalHeading = doc.querySelector<HTMLHeadingElement>('h1')
+    const errors: unknown[] = []
+
+    hydrateRoot(doc as any, <App />, {
+      onRecoverableError: (error) => errors.push(error),
+    })
+
+    expect(errors).toEqual([])
+    expect(doc.documentElement).toBe(originalHtml)
+    expect(doc.head).toBe(originalHead)
+    expect(doc.querySelector('#critical')).toBe(originalCriticalStyle)
+    expect(doc.querySelector('.darkreader')).toBe(injectedStyle)
+    expect(doc.querySelector('h1')).toBe(originalHeading)
+    expect(originalHeading?.style.getPropertyValue('--darkreader-inline-color')).toBe(
+      '#ff1a1a',
+    )
+  })
+
+  it('repairs document shell and head mismatches in place', () => {
+    let doc!: Document
+    const documentClassesSeenDuringRender: string[] = []
+
+    function App() {
+      documentClassesSeenDuringRender.push(doc.documentElement.className)
+      return (
+        <html className="client">
+          <head>
+            <style id="critical">{'body{color:red}'}</style>
+          </head>
+          <body>
+            <h1 id="title">client</h1>
+          </body>
+        </html>
+      )
+    }
+
+    doc = buildDocumentFrom(
+      '<!doctype html><html class="server"><head><style id="critical">body{color:blue}</style></head><body><h1 id="title">client</h1></body></html>',
+    )
+    const originalHtml = doc.documentElement
+    const originalHead = doc.head
+    const errors: unknown[] = []
+
+    expect(() => {
+      hydrateRoot(doc as any, <App />, {
+        onRecoverableError: (error) => errors.push(error),
+      })
+    }).not.toThrow()
+
+    expect(errors).toHaveLength(2)
+    expect(documentClassesSeenDuringRender).toEqual(['server'])
+    expect(doc.documentElement).toBe(originalHtml)
+    expect(doc.documentElement.className).toBe('client')
+    expect(doc.head).toBe(originalHead)
+    expect(doc.querySelector('#title')?.textContent).toBe('client')
+    expect(doc.querySelector('#critical')?.textContent).toBe('body{color:red}')
+  })
+
+  it('falls back to body-only client render on document body text mismatch', () => {
+    function App() {
+      return (
+        <html>
+          <head>
+            <title>client</title>
+            <style id="critical">{'body{color:red}'}</style>
+          </head>
+          <body>
+            <nav id="nav">nav</nav>
+            <h1 id="title">Solid</h1>
+          </body>
+        </html>
+      )
+    }
+
+    const doc = buildDocumentFrom(
+      '<!doctype html><html><head><title>client</title><style id="critical">body{color:red}</style></head><body><nav id="nav">nav</nav><h1 id="title">React</h1><p id="old">old</p></body></html>',
+    )
+    const origHtml = doc.documentElement
+    const origHead = doc.head
+    const origStyle = doc.querySelector('#critical')
+    const errors: unknown[] = []
+
+    hydrateRoot(doc as any, <App />, {
+      onRecoverableError: (e) => errors.push(e),
+    })
+
+    const htmlEls = Array.from(doc.childNodes).filter(
+      (n) => n.nodeType === 1 && (n as Element).tagName.toLowerCase() === 'html',
+    )
+    expect(errors.length).toBeGreaterThanOrEqual(1)
+    expect(htmlEls.length).toBe(1)
+    expect(doc.documentElement).toBe(origHtml)
+    expect(doc.head).toBe(origHead)
+    expect(doc.querySelector('#critical')).toBe(origStyle)
+    expect(doc.querySelector('#title')?.textContent).toBe('Solid')
+    expect(doc.querySelector('#old')).toBeNull()
+  })
+
+  it('recovers a Suspense mismatch inside document body without replacing head or outer body siblings', () => {
+    function App({ label }: { label: string }) {
+      return (
+        <html>
+          <head>
+            <title>client</title>
+            <style id="critical">{'body{color:red}'}</style>
+          </head>
+          <body>
+            <header id="shell">shell</header>
+            <React.Suspense fallback={<i>loading</i>}>
+              <main id="route">{label}</main>
+            </React.Suspense>
+            <footer id="foot">foot</footer>
+          </body>
+        </html>
+      )
+    }
+
+    const html = renderToString(<App label="React" />)
+    const doc = buildDocumentFrom(html)
+    const origHtml = doc.documentElement
+    const origHead = doc.head
+    const origStyle = doc.querySelector('#critical')
+    const shell = doc.querySelector('#shell')
+    const foot = doc.querySelector('#foot')
+    const errors: unknown[] = []
+
+    hydrateRoot(doc as any, <App label="Solid" />, {
+      onRecoverableError: (e) => errors.push(e),
+    })
+
+    expect(errors.length).toBeGreaterThanOrEqual(1)
+    expect(doc.documentElement).toBe(origHtml)
+    expect(doc.head).toBe(origHead)
+    expect(doc.querySelector('#critical')).toBe(origStyle)
+    expect(doc.querySelector('#shell')).toBe(shell)
+    expect(doc.querySelector('#foot')).toBe(foot)
+    expect(doc.querySelectorAll('#route').length).toBe(1)
+    expect(doc.querySelector('#route')?.textContent).toBe('Solid')
   })
 })
